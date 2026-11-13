@@ -442,7 +442,7 @@ if ShotCodecModule and rawget(ShotCodecModule, "encodeFire") then
 	end)
 
 	getgenv().OldEncodeFire = oldEncode
-	print(string.format("ESP + Silent Aim [J] + Center Lock + Max Zoom 10000 เปิดใช้งานสำเร็จ! (FOV: %d | ปรับด้วย [ ])", math.floor(CONFIG.FOV)))
+	print(string.format("")
 else
 	warn("ไม่พบฟังก์ชัน encodeFire")
 end
