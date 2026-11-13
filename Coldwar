@@ -442,7 +442,4 @@ if ShotCodecModule and rawget(ShotCodecModule, "encodeFire") then
 	end)
 
 	getgenv().OldEncodeFire = oldEncode
-	print(string.format("")
-else
-	warn("ไม่พบฟังก์ชัน encodeFire")
 end
