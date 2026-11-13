@@ -1,0 +1,448 @@
+--// ============================================================
+--//  COMBINED: ESP (sync target) + SILENT AIM (ปุ่ม J) + CENTER LOCK + MAX ZOOMOUT
+--//  ตั้งค่า FOV ได้ที่ CONFIG ด้านล่าง หรือกด [ / ] ปรับสด
+--//  ไม่มีเป้า/ปิด Silent Aim → ยิงตาม Dot แดงกลางจอเสมอ
+--//  รันซ้ำได้ปลอดภัย: ล้างของเก่าอัตโนมัติก่อนทุกครั้ง
+--// ============================================================
+
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+local Workspace   = game:GetService("Workspace")
+local UIS         = game:GetService("UserInputService")
+local Camera      = Workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ShotCodecModule   = require(ReplicatedStorage.Shared.Ballistics.ShotCodec)
+
+if not Drawing or not Drawing.new then
+	warn("Executor ของคุณไม่รองรับ Drawing API!")
+        return
+end
+
+--// ---------- 0. CONFIG (จุดใส่ค่า FOV) ----------
+getgenv().AimConfig = getgenv().AimConfig or {
+	FOV      = 100,   -- <<< ใส่ค่า FOV ที่นี่ (รัศมีหน่วยพิกเซลจากกลางจอ)
+	FOV_MIN  = 20,    -- ค่า FOV ต่ำสุดที่กดปรับได้
+	FOV_MAX  = 800,   -- ค่า FOV สูงสุดที่กดปรับได้
+	FOV_STEP = 10,    -- ระยะก้าวเวลาเลื่อน FOV ด้วยปุ่ม
+}
+local CONFIG = getgenv().AimConfig
+
+--// ---------- 1. ล้างของเก่าทั้งหมด (กันรันซ้ำ) ----------
+local function unloadAll()
+	getgenv().AimLoaded = nil
+
+	getgenv().ActiveESPConnections = getgenv().ActiveESPConnections or {}
+	for _, conn in pairs(getgenv().ActiveESPConnections) do
+		if typeof(conn) == "RBXScriptConnection" then
+			pcall(function() conn:Disconnect() end)
+		end
+	end
+	getgenv().ActiveESPConnections = {}
+
+	getgenv().ActiveESP = getgenv().ActiveESP or {}
+	for _, data in pairs(getgenv().ActiveESP) do
+		if type(data) == "table" then
+			for _, obj in pairs(data) do
+				if typeof(obj) == "RBXScriptConnection" then
+					pcall(function() obj:Disconnect() end)
+				else
+					pcall(function() obj:Remove() end)
+					pcall(function() obj:Destroy() end)
+				end
+			end
+		end
+	end
+	getgenv().ActiveESP = {}
+
+	for _, key in ipairs({ "CenterDot", "StatusText", "FovCircle" }) do
+		local obj = getgenv()[key]
+		if obj then
+			pcall(function() obj:Remove() end)
+			getgenv()[key] = nil
+		end
+	end
+
+	if getgenv().OldEncodeFire then
+		pcall(function() hookfunction(ShotCodecModule.encodeFire, getgenv().OldEncodeFire) end)
+		getgenv().OldEncodeFire = nil
+	end
+
+	if getgenv().OriginalMaxZoom then
+		pcall(function() LocalPlayer.CameraMaxZoomDistance = getgenv().OriginalMaxZoom end)
+		getgenv().OriginalMaxZoom = nil
+	end
+	if getgenv().OriginalMinZoom then
+		pcall(function() LocalPlayer.CameraMinZoomDistance = getgenv().OriginalMinZoom end)
+		getgenv().OriginalMinZoom = nil
+	end
+
+	getgenv().CurrentTargetPart      = nil
+	getgenv().CurrentTargetCharacter = nil
+end
+
+getgenv().Unload = unloadAll
+if getgenv().AimLoaded then
+	pcall(unloadAll)
+end
+getgenv().AimLoaded = true
+
+getgenv().ActiveESPConnections = getgenv().ActiveESPConnections or {}
+getgenv().ActiveESP            = getgenv().ActiveESP or {}
+
+--// ---------- 2. Helper ร่วม ----------
+local function getPlayerFromCharacter(character)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player.Character == character then
+			return player
+		end
+	end
+	return nil
+end
+
+local function isVisible(targetPart, targetCharacter)
+	local origin    = Camera.CFrame.Position
+	local direction = targetPart.Position - origin
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LocalPlayer.Character }
+	params.IgnoreWater = true
+
+	local result = Workspace:Raycast(origin, direction, params)
+	if result and result.Instance:IsDescendantOf(targetCharacter) then
+		return true
+	end
+	return false
+end
+
+local function getBestTarget()
+	local bestPart         = nil
+	local bestCharacter    = nil
+	local shortestDistance = math.huge
+	local screenCenter     = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+	local fov              = CONFIG.FOV
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+			if humanoid and humanoid.Health > 0 then
+				if not player.Team or player.Team ~= LocalPlayer.Team then
+					for _, part in ipairs(player.Character:GetChildren()) do
+						if part:IsA("BasePart") then
+							local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+							if onScreen then
+								local distanceToCenter =
+									(Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+
+								--// เช็ก FOV ก่อนเสมอ: ต้องอยู่ในรัศมีที่ตั้งไว้
+								if distanceToCenter <= fov and distanceToCenter < shortestDistance then
+									if isVisible(part, player.Character) then
+										shortestDistance = distanceToCenter
+										bestPart         = part
+										bestCharacter    = player.Character
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return bestPart, bestCharacter
+end
+
+--// หาตำแหน่งปลายทางใต้ Dot แดงกลางจอ (ใช้ตอนไม่มีเป้า)
+local function getCenterAimPoint()
+	local vs  = Camera.ViewportSize
+	local ray = Camera:ViewportPointToRay(vs.X / 2, vs.Y / 2)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LocalPlayer.Character }
+	params.IgnoreWater = true
+
+	local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
+	if result then
+		return result.Position
+	end
+	return ray.Origin + ray.Direction * 5000
+end
+
+--// ---------- 3. Max Zoomout ----------
+getgenv().MaxZoomDistance = 10000
+getgenv().MinZoomDistance = 0.5
+
+getgenv().OriginalMaxZoom = LocalPlayer.CameraMaxZoomDistance
+getgenv().OriginalMinZoom = LocalPlayer.CameraMinZoomDistance
+
+local function applyZoom()
+	pcall(function()
+		if LocalPlayer.CameraMaxZoomDistance ~= getgenv().MaxZoomDistance then
+			LocalPlayer.CameraMaxZoomDistance = getgenv().MaxZoomDistance
+		end
+		if LocalPlayer.CameraMinZoomDistance ~= getgenv().MinZoomDistance then
+			LocalPlayer.CameraMinZoomDistance = getgenv().MinZoomDistance
+		end
+	end)
+end
+
+applyZoom()
+
+table.insert(getgenv().ActiveESPConnections,
+	LocalPlayer:GetPropertyChangedSignal("CameraMaxZoomDistance"):Connect(applyZoom))
+table.insert(getgenv().ActiveESPConnections,
+	LocalPlayer:GetPropertyChangedSignal("CameraMinZoomDistance"):Connect(applyZoom))
+
+--// ---------- 4. ตัวอัปเดตเป้า (ทำงานก่อน ESP เสมอ) ----------
+table.insert(getgenv().ActiveESPConnections, RunService.RenderStepped:Connect(function()
+	local part, character = getBestTarget()
+	getgenv().CurrentTargetPart      = part
+	getgenv().CurrentTargetCharacter = character
+end))
+
+--// ---------- 5. ESP ----------
+local function createESP(character)
+	if not character or getgenv().ActiveESP[character] then return end
+
+	local rootPart = character:WaitForChild("HumanoidRootPart", 5)
+	local head     = character:WaitForChild("Head", 5)
+	local humanoid = character:WaitForChild("Humanoid", 5)
+	if not rootPart or not head or not humanoid then return end
+
+	local box = Drawing.new("Square")
+	box.Visible   = false
+	box.Color     = Color3.fromRGB(255, 0, 0)
+	box.Thickness = 1.5
+	box.Filled    = false
+
+	local tracer = Drawing.new("Line")
+	tracer.Visible   = false
+	tracer.Color     = Color3.fromRGB(255, 0, 0)
+	tracer.Thickness = 1
+
+	getgenv().ActiveESP[character] = { Box = box, Tracer = tracer }
+
+	local connection
+	connection = RunService.RenderStepped:Connect(function()
+		if not character or not character.Parent or humanoid.Health <= 0 then
+			box.Visible    = false
+			tracer.Visible = false
+			return
+		end
+
+		local targetPlayer = getPlayerFromCharacter(character)
+		if targetPlayer == LocalPlayer then
+			box.Visible    = false
+			tracer.Visible = false
+			return
+		end
+
+		if LocalPlayer.Team and targetPlayer and targetPlayer.Team == LocalPlayer.Team then
+			box.Visible    = false
+			tracer.Visible = false
+			return
+		end
+
+		local myRootPart = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+		if not myRootPart then
+			box.Visible    = false
+			tracer.Visible = false
+			return
+		end
+
+		local isCurrentTarget = (character == getgenv().CurrentTargetCharacter)
+		if isCurrentTarget then
+			local rainbow  = Color3.fromHSV((tick() * 0.5) % 1, 1, 1)
+			box.Color      = rainbow
+			box.Thickness  = 3
+			tracer.Color   = rainbow
+			tracer.Thickness = 2
+		else
+			box.Color      = Color3.fromRGB(255, 0, 0)
+			box.Thickness  = 1.5
+			tracer.Color   = Color3.fromRGB(255, 0, 0)
+			tracer.Thickness = 1
+		end
+
+		local distance = (myRootPart.Position - rootPart.Position).Magnitude
+
+		local minDistance = 100
+		local maxDistance = getgenv().MaxZoomDistance
+		local fadeFactor  = math.clamp((distance - minDistance) / (maxDistance - minDistance), 0, 0.85)
+		local alpha       = 1 - fadeFactor
+
+		if isCurrentTarget then
+			alpha = 1
+		end
+
+		local rootPos, onScreen = Camera:WorldToViewportPoint(rootPart.Position)
+
+		if onScreen then
+			local headPos = Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
+			local legPos  = Camera:WorldToViewportPoint(rootPart.Position - Vector3.new(0, 2.5, 0))
+
+			local height = math.abs(headPos.Y - legPos.Y)
+			local width  = height / 2
+
+			if width < 2 then width = 2 end
+			if height < 4 then height = 4 end
+
+			local boxX = rootPos.X - width / 2
+			local boxY = headPos.Y
+
+			box.Size         = Vector2.new(width, height)
+			box.Position     = Vector2.new(boxX, boxY)
+			box.Transparency = alpha
+			box.Visible      = true
+
+			local viewportSize = Camera.ViewportSize
+			tracer.From         = Vector2.new(viewportSize.X / 2, 0)   -- อยู่ขอบบนจอ
+			tracer.To           = Vector2.new(boxX + (width / 2), boxY + height)
+			tracer.Transparency = alpha
+			tracer.Visible      = true
+		else
+			box.Visible    = false
+			tracer.Visible = false
+		end
+	end)
+
+	table.insert(getgenv().ActiveESPConnections, connection)
+
+	character.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			pcall(function() box:Remove() end)
+			pcall(function() tracer:Remove() end)
+			getgenv().ActiveESP[character] = nil
+		end
+	end)
+end
+
+local charactersFolder = Workspace:FindFirstChild("Characters")
+if charactersFolder then
+	for _, character in ipairs(charactersFolder:GetChildren()) do
+		if character:IsA("Model") then
+			createESP(character)
+		end
+	end
+
+	table.insert(getgenv().ActiveESPConnections, charactersFolder.ChildAdded:Connect(function(character)
+		if character:IsA("Model") then
+			task.spawn(function() createESP(character) end)
+		end
+	end))
+else
+	warn("ไม่พบโฟลเดอร์ workspace.Characters กรุณาตรวจสอบชื่อใหม่อีกครั้ง")
+end
+
+--// ---------- 6. วง FOV + จุดกลางจอ ----------
+local fovCircle = Drawing.new("Circle")
+fovCircle.Visible      = false
+fovCircle.Filled       = false
+fovCircle.Thickness    = 1
+fovCircle.Transparency = 0.35
+fovCircle.Color        = Color3.fromRGB(255, 255, 255)
+fovCircle.Radius       = CONFIG.FOV
+getgenv().FovCircle = fovCircle
+
+local centerDot = Drawing.new("Circle")
+centerDot.Visible   = true
+centerDot.Radius    = 2
+centerDot.Filled    = true
+centerDot.Color     = Color3.fromRGB(255, 0, 0)
+centerDot.Thickness = 1
+
+getgenv().CenterDot = centerDot
+
+table.insert(getgenv().ActiveESPConnections, RunService.RenderStepped:Connect(function()
+	local vs = Camera.ViewportSize
+	local center = Vector2.new(vs.X / 2, vs.Y / 2)
+
+	centerDot.Position = center
+	fovCircle.Position = center
+	fovCircle.Radius   = CONFIG.FOV
+	fovCircle.Visible  = getgenv().SilentAimEnabled
+end))
+
+--// ---------- 7. ตัวบอกสถานะ ----------
+local statusText = Drawing.new("Text")
+statusText.Center    = true
+statusText.Outline   = true
+statusText.Size      = 16
+statusText.Color     = Color3.fromRGB(255, 0, 0)
+statusText.Visible   = true
+statusText.Text      = "SILENT AIM: OFF [J] | FOV: " .. CONFIG.FOV .. " [ / ]"
+
+getgenv().StatusText = statusText
+
+table.insert(getgenv().ActiveESPConnections, RunService.RenderStepped:Connect(function()
+	local vs = Camera.ViewportSize
+	statusText.Position = Vector2.new(vs.X / 2, vs.Y - 70)
+end))
+
+--// ---------- 8. ปุ่ม: J เปิด/ปิด | [ ] ปรับ FOV ----------
+getgenv().SilentAimEnabled = true
+
+local function refreshStatus()
+	statusText.Color = getgenv().SilentAimEnabled
+		and Color3.fromRGB(0, 255, 120)
+		or  Color3.fromRGB(255, 60, 60)
+
+	centerDot.Color  = Color3.fromRGB(255, 0, 0)
+	centerDot.Radius = 2
+
+	statusText.Text = string.format("SILENT AIM: %s [J] | FOV: %d | For FOV adjust [ or ]",
+		getgenv().SilentAimEnabled and "ON" or "OFF", math.floor(CONFIG.FOV))
+end
+
+refreshStatus()
+
+table.insert(getgenv().ActiveESPConnections, UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+
+	if input.KeyCode == Enum.KeyCode.J then
+		getgenv().SilentAimEnabled = not getgenv().SilentAimEnabled
+		refreshStatus()
+	elseif input.KeyCode == Enum.KeyCode.LeftBracket then
+		CONFIG.FOV = math.clamp(CONFIG.FOV - CONFIG.FOV_STEP, CONFIG.FOV_MIN, CONFIG.FOV_MAX)
+		refreshStatus()
+	elseif input.KeyCode == Enum.KeyCode.RightBracket then
+		CONFIG.FOV = math.clamp(CONFIG.FOV + CONFIG.FOV_STEP, CONFIG.FOV_MIN, CONFIG.FOV_MAX)
+		refreshStatus()
+	end
+end))
+
+--// ---------- 9. Silent Aim + Center Lock ----------
+if ShotCodecModule and rawget(ShotCodecModule, "encodeFire") then
+	local oldEncode
+	oldEncode = hookfunction(ShotCodecModule.encodeFire, function(...)
+		local args     = { ... }
+		local origin   = args[3]
+		local subTable = args[5] and args[5][1]
+
+		if origin and subTable and typeof(subTable.Direction) == "Vector3" then
+			local targetPart = getgenv().CurrentTargetPart
+
+			if getgenv().SilentAimEnabled and targetPart and targetPart.Parent then
+				-- มีเป้า + เปิด silent aim → ล็อคเป้า
+				subTable.Direction = (targetPart.Position - origin).Unit
+			else
+				-- ไม่มีเป้า หรือปิด silent aim → ยิงตาม Dot แดงกลางจอ (ทำงานตลอด)
+				local aimPoint = getCenterAimPoint()
+				if aimPoint then
+					subTable.Direction = (aimPoint - origin).Unit
+				end
+			end
+		end
+
+		return oldEncode(unpack(args))
+	end)
+
+	getgenv().OldEncodeFire = oldEncode
+	print(string.format("ESP + Silent Aim [J] + Center Lock + Max Zoom 10000 เปิดใช้งานสำเร็จ! (FOV: %d | ปรับด้วย [ ])", math.floor(CONFIG.FOV)))
+else
+	warn("ไม่พบฟังก์ชัน encodeFire")
+end
